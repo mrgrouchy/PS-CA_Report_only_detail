@@ -198,7 +198,7 @@ $mfaImpactReport = foreach ($signIn in $allSignIns) {
                 $mfaRequired = "No - Already Completed MFA"
                 $reason = "User already performed MFA for this session"
             }
-            elseif ($riskLevel -eq 'none' -or $riskLevel -eq $null) {
+            elseif ($riskLevel -eq 'none' -or $null -eq $riskLevel) {
                 $mfaRequired = "No - No Risk Detected"
                 $reason = "Sign-in risk is none"
             }
