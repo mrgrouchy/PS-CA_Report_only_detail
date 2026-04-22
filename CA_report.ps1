@@ -1,16 +1,18 @@
 <#
 .SYNOPSIS
-Analyzes report-only Conditional Access sign-in risk and MFA challenge impact.
+Analyzes unexpected user impact from report-only Conditional Access risk/MFA policies.
 
 .DESCRIPTION
 Connects to Microsoft Graph, reads report-only Conditional Access policies, correlates
 them with recent sign-in activity, and exports detailed CSV reports that show where MFA
-would have been required if those policies were enforced.
+would have been required if those policies were enforced. Users already included in the
+enabled production policy target groups are excluded so outputs focus on unexpected impact.
 
 .EXAMPLE
 PS> .\CA_report.ps1
 Prompts you to choose a target report-only policy (or all), runs the analysis for the
-last 30 days, and exports CSV reports to the current directory.
+last 30 days, auto-detects the enabled production policy with 4 target groups when
+possible, and exports CSV reports to the current directory.
 
 .EXAMPLE
 PS> pwsh -ExecutionPolicy Bypass -File .\CA_report.ps1
@@ -21,17 +23,32 @@ PS> .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins"
 Runs analysis for the specified report-only policy name (or policy ID) without interactive
 selection.
 
+.EXAMPLE
+PS> .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins" -ProdPolicy "Prod - Sign-in Risk - MFA"
+Runs analysis against a specific report-only policy and explicitly uses the named enabled
+production policy to resolve expected-user exclusions from its target groups.
+
 .NOTES
-Required Microsoft Graph scopes: AuditLog.Read.All, Policy.Read.All
+Required Microsoft Graph scopes: AuditLog.Read.All, Policy.Read.All, Group.Read.All
 #>
 
 param(
     [string]$TargetPolicy,
-    [switch]$AllPolicies
+    [switch]$AllPolicies,
+    [string]$ProdPolicy
+)
+
+# Hardcode expected-impact group IDs here (recommended: object IDs, not names).
+# If populated, these groups take precedence over -ProdPolicy/auto-discovery.
+$HardcodedExpectedGroupIds = @(
+    # "00000000-0000-0000-0000-000000000001",
+    # "00000000-0000-0000-0000-000000000002",
+    # "00000000-0000-0000-0000-000000000003",
+    # "00000000-0000-0000-0000-000000000004"
 )
 
 # Connect with required permissions
-Connect-MgGraph -Scopes "AuditLog.Read.All", "Policy.Read.All"
+Connect-MgGraph -Scopes "AuditLog.Read.All", "Policy.Read.All", "Group.Read.All"
 
 # Define time range for analysis (adjust as needed)
 $startDate = (Get-Date).AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -48,6 +65,51 @@ function Get-SafePercentage {
     }
 
     return [math]::Round(($Numerator / $Denominator) * 100, 2)
+}
+
+function Get-GroupMemberUserIds {
+    param(
+        [string[]]$GroupIds
+    )
+
+    $userIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $resolvedGroups = @()
+
+    foreach ($groupId in @($GroupIds | Where-Object { $_ -and $_ -ne 'All' })) {
+        $groupName = $groupId
+        try {
+            $groupInfo = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/groups/$groupId?`$select=displayName,id" -Method GET
+            if ($groupInfo.displayName) {
+                $groupName = $groupInfo.displayName
+            }
+        } catch {}
+
+        $resolvedGroups += [PSCustomObject]@{
+            GroupId = $groupId
+            GroupName = $groupName
+        }
+
+        $membersUri = "https://graph.microsoft.com/v1.0/groups/$groupId/transitiveMembers/microsoft.graph.user?`$select=id&`$top=999"
+        do {
+            try {
+                $memberResponse = Invoke-MgGraphRequest -Uri $membersUri -Method GET
+                foreach ($member in @($memberResponse.value)) {
+                    if ($member.id) {
+                        $null = $userIds.Add($member.id)
+                    }
+                }
+                $membersUri = $memberResponse.'@odata.nextLink'
+            } catch {
+                Write-Host "Warning: Unable to read members for group '$groupName' ($groupId). Skipping this group." -ForegroundColor Yellow
+                break
+            }
+        } while ($membersUri)
+    }
+
+    return [PSCustomObject]@{
+        UserIds = $userIds
+        Groups = $resolvedGroups
+    }
 }
 
 Write-Host "=== SIGN-IN RISK & MFA REQUIREMENT ANALYSIS ===" -ForegroundColor Cyan
@@ -127,6 +189,76 @@ if (-not $AllPolicies) {
 $targetPolicyIds = @($targetPolicies.Id)
 Write-Host "`nTarget policy scope: $($targetPolicies.Count) policy/policies selected." -ForegroundColor Green
 $targetPolicies | ForEach-Object { Write-Host "  - $($_.DisplayName) [$($_.Id)]" -ForegroundColor White }
+
+# Resolve prod policy users that are expected to be impacted already
+$prodPolicies = $caPolicies | Where-Object {
+    $_.State -eq 'enabled' -and (
+        $_.Conditions.SignInRiskLevels.Count -gt 0 -or
+        $_.GrantControls.BuiltInControls -contains 'mfa'
+    )
+}
+
+$expectedUserIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$expectedGroups = @()
+$hardcodedGroupIds = @($HardcodedExpectedGroupIds | Where-Object { $_ -and $_ -ne 'All' })
+if ($hardcodedGroupIds.Count -gt 0) {
+    Write-Host "`nResolving expected impacted users from hardcoded target groups..." -ForegroundColor Cyan
+
+    $groupLookup = Get-GroupMemberUserIds -GroupIds $hardcodedGroupIds
+    $expectedUserIds = $groupLookup.UserIds
+    $expectedGroups = $groupLookup.Groups
+
+    Write-Host "Found $($expectedGroups.Count) hardcoded groups with $($expectedUserIds.Count) unique users to exclude as expected impact." -ForegroundColor Green
+    $expectedGroups | ForEach-Object {
+        Write-Host "  - $($_.GroupName) [$($_.GroupId)]" -ForegroundColor Gray
+    }
+} else {
+    $selectedProdPolicy = $null
+    if ($ProdPolicy) {
+        $matchedProdPolicies = @(
+            $prodPolicies | Where-Object {
+                $_.DisplayName -like "*$ProdPolicy*" -or $_.Id -eq $ProdPolicy
+            }
+        )
+
+        if ($matchedProdPolicies.Count -eq 1) {
+            $selectedProdPolicy = $matchedProdPolicies[0]
+        } elseif ($matchedProdPolicies.Count -gt 1) {
+            Write-Host "Multiple enabled prod policies matched '$ProdPolicy'. Using the first match: $($matchedProdPolicies[0].DisplayName)" -ForegroundColor Yellow
+            $selectedProdPolicy = $matchedProdPolicies[0]
+        } else {
+            Write-Host "No enabled prod policy matched '$ProdPolicy'. No expected-user exclusion will be applied." -ForegroundColor Yellow
+        }
+    } else {
+        $fourGroupCandidates = @($prodPolicies | Where-Object { @($_.Conditions.Users.IncludeGroups).Count -eq 4 })
+        if ($fourGroupCandidates.Count -ge 1) {
+            $selectedProdPolicy = $fourGroupCandidates[0]
+        } elseif ($prodPolicies.Count -eq 1) {
+            $selectedProdPolicy = $prodPolicies[0]
+        }
+    }
+
+    if ($selectedProdPolicy) {
+        $prodTargetGroupIds = @($selectedProdPolicy.Conditions.Users.IncludeGroups | Where-Object { $_ -and $_ -ne 'All' })
+        if ($prodTargetGroupIds.Count -gt 0) {
+            Write-Host "`nResolving expected impacted users from prod policy group targets..." -ForegroundColor Cyan
+            Write-Host "Prod policy: $($selectedProdPolicy.DisplayName) [$($selectedProdPolicy.Id)]" -ForegroundColor White
+
+            $groupLookup = Get-GroupMemberUserIds -GroupIds $prodTargetGroupIds
+            $expectedUserIds = $groupLookup.UserIds
+            $expectedGroups = $groupLookup.Groups
+
+            Write-Host "Found $($expectedGroups.Count) target groups with $($expectedUserIds.Count) unique users to exclude as expected impact." -ForegroundColor Green
+            $expectedGroups | ForEach-Object {
+                Write-Host "  - $($_.GroupName) [$($_.GroupId)]" -ForegroundColor Gray
+            }
+        } else {
+            Write-Host "Prod policy '$($selectedProdPolicy.DisplayName)' has no explicit include groups. No expected-user exclusion will be applied." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "`nNo prod policy was auto-resolved for expected-user exclusion. Run with -ProdPolicy to force a specific enabled policy." -ForegroundColor Yellow
+    }
+}
 
 # Fetch sign-in logs with report-only results
 Write-Host "`nFetching sign-in logs (this may take several minutes)..." -ForegroundColor Cyan
@@ -277,6 +409,20 @@ $mfaImpactReport = foreach ($signIn in $allSignIns) {
             SignInId = $signIn.id
         }
     }
+}
+
+# Keep only unexpected impact users (exclude users already targeted by prod policy groups)
+if ($expectedUserIds.Count -gt 0) {
+    $preFilterCount = $mfaImpactReport.Count
+    $mfaImpactReport = @(
+        $mfaImpactReport | Where-Object {
+            -not ($_.UserId -and $expectedUserIds.Contains($_.UserId))
+        }
+    )
+    $postFilterCount = $mfaImpactReport.Count
+    Write-Host "`nExcluded $($preFilterCount - $postFilterCount) rows for users already covered by prod policy target groups." -ForegroundColor Green
+} else {
+    Write-Host "`nExpected-user exclusion not applied; continuing with all impacted users." -ForegroundColor Yellow
 }
 
 # Export detailed report
