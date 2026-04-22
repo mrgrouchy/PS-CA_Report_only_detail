@@ -2,6 +2,8 @@
 
 This repository contains a PowerShell script that analyzes Microsoft Entra ID sign-ins against **report-only** Conditional Access (CA) policies and estimates where MFA would have been challenged if those policies were enforced.
 
+The script is optimized to surface **unexpected impacted users** by excluding users already targeted by your production policy groups.
+
 ## Script
 
 - `CA_report.ps1`
@@ -15,7 +17,8 @@ The script:
 3. Filters for policies related to sign-in risk and/or MFA grant controls.
 4. Pulls sign-in logs for the last 30 days.
 5. Correlates policy evaluation results with sign-in risk and authentication context.
-6. Exports detailed and summary CSV reports.
+6. Excludes users already in expected-impact groups (hardcoded group IDs, or production policy target groups).
+7. Exports detailed and summary CSV reports.
 
 ## Prerequisites
 
@@ -24,6 +27,7 @@ The script:
 - Permissions/scopes:
   - `AuditLog.Read.All`
   - `Policy.Read.All`
+  - `Group.Read.All`
 - Ability to run scripts in your PowerShell environment
 
 ## Usage
@@ -50,11 +54,39 @@ Run non-interactively for one target policy (name or ID):
 .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins"
 ```
 
+Run with explicit production policy selection for expected-user exclusion:
+
+```powershell
+.\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins" -ProdPolicy "Prod - Sign-in Risk - MFA"
+```
+
 Run all matching report-only policies without prompt:
 
 ```powershell
 .\CA_report.ps1 -AllPolicies
 ```
+
+## Expected-Impact Exclusion
+
+The script excludes users who are already expected to be impacted by production targeting:
+
+1. If `$HardcodedExpectedGroupIds` is populated in `CA_report.ps1`, those groups are used.
+2. Otherwise, the script falls back to:
+   - `-ProdPolicy` (if provided), or
+   - auto-discovery of an enabled risk/MFA policy (prefers one with 4 include groups).
+
+To hardcode your 4 production target groups, edit this block in `CA_report.ps1`:
+
+```powershell
+$HardcodedExpectedGroupIds = @(
+    "group-object-id-1",
+    "group-object-id-2",
+    "group-object-id-3",
+    "group-object-id-4"
+)
+```
+
+Use Microsoft Entra group **object IDs** (GUIDs), not display names.
 
 ## Output Files
 
@@ -71,3 +103,4 @@ The script generates:
 
 - The current script uses a fixed 30-day lookback window.
 - This report is based on report-only policy evaluation and historical sign-in data; it is intended for impact analysis before enforcing CA policies.
+- If expected-impact groups cannot be resolved, the script continues and reports all impacted users.
