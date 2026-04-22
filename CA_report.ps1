@@ -35,7 +35,8 @@ Required Microsoft Graph scopes: AuditLog.Read.All, Policy.Read.All, Group.Read.
 param(
     [string]$TargetPolicy,
     [switch]$AllPolicies,
-    [string]$ProdPolicy
+    [string]$ProdPolicy,
+    [switch]$All
 )
 
 # Hardcode expected-impact group IDs here (recommended: object IDs, not names).
@@ -200,63 +201,67 @@ $prodPolicies = $caPolicies | Where-Object {
 
 $expectedUserIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $expectedGroups = @()
-$hardcodedGroupIds = @($HardcodedExpectedGroupIds | Where-Object { $_ -and $_ -ne 'All' })
-if ($hardcodedGroupIds.Count -gt 0) {
-    Write-Host "`nResolving expected impacted users from hardcoded target groups..." -ForegroundColor Cyan
-
-    $groupLookup = Get-GroupMemberUserIds -GroupIds $hardcodedGroupIds
-    $expectedUserIds = $groupLookup.UserIds
-    $expectedGroups = $groupLookup.Groups
-
-    Write-Host "Found $($expectedGroups.Count) hardcoded groups with $($expectedUserIds.Count) unique users to exclude as expected impact." -ForegroundColor Green
-    $expectedGroups | ForEach-Object {
-        Write-Host "  - $($_.GroupName) [$($_.GroupId)]" -ForegroundColor Gray
-    }
+if ($All) {
+    Write-Host "`n-All switch specified. Group-based expected-user exclusion is disabled." -ForegroundColor Yellow
 } else {
-    $selectedProdPolicy = $null
-    if ($ProdPolicy) {
-        $matchedProdPolicies = @(
-            $prodPolicies | Where-Object {
-                $_.DisplayName -like "*$ProdPolicy*" -or $_.Id -eq $ProdPolicy
-            }
-        )
+    $hardcodedGroupIds = @($HardcodedExpectedGroupIds | Where-Object { $_ -and $_ -ne 'All' })
+    if ($hardcodedGroupIds.Count -gt 0) {
+        Write-Host "`nResolving expected impacted users from hardcoded target groups..." -ForegroundColor Cyan
 
-        if ($matchedProdPolicies.Count -eq 1) {
-            $selectedProdPolicy = $matchedProdPolicies[0]
-        } elseif ($matchedProdPolicies.Count -gt 1) {
-            Write-Host "Multiple enabled prod policies matched '$ProdPolicy'. Using the first match: $($matchedProdPolicies[0].DisplayName)" -ForegroundColor Yellow
-            $selectedProdPolicy = $matchedProdPolicies[0]
-        } else {
-            Write-Host "No enabled prod policy matched '$ProdPolicy'. No expected-user exclusion will be applied." -ForegroundColor Yellow
+        $groupLookup = Get-GroupMemberUserIds -GroupIds $hardcodedGroupIds
+        $expectedUserIds = $groupLookup.UserIds
+        $expectedGroups = $groupLookup.Groups
+
+        Write-Host "Found $($expectedGroups.Count) hardcoded groups with $($expectedUserIds.Count) unique users to exclude as expected impact." -ForegroundColor Green
+        $expectedGroups | ForEach-Object {
+            Write-Host "  - $($_.GroupName) [$($_.GroupId)]" -ForegroundColor Gray
         }
     } else {
-        $fourGroupCandidates = @($prodPolicies | Where-Object { @($_.Conditions.Users.IncludeGroups).Count -eq 4 })
-        if ($fourGroupCandidates.Count -ge 1) {
-            $selectedProdPolicy = $fourGroupCandidates[0]
-        } elseif ($prodPolicies.Count -eq 1) {
-            $selectedProdPolicy = $prodPolicies[0]
-        }
-    }
+        $selectedProdPolicy = $null
+        if ($ProdPolicy) {
+            $matchedProdPolicies = @(
+                $prodPolicies | Where-Object {
+                    $_.DisplayName -like "*$ProdPolicy*" -or $_.Id -eq $ProdPolicy
+                }
+            )
 
-    if ($selectedProdPolicy) {
-        $prodTargetGroupIds = @($selectedProdPolicy.Conditions.Users.IncludeGroups | Where-Object { $_ -and $_ -ne 'All' })
-        if ($prodTargetGroupIds.Count -gt 0) {
-            Write-Host "`nResolving expected impacted users from prod policy group targets..." -ForegroundColor Cyan
-            Write-Host "Prod policy: $($selectedProdPolicy.DisplayName) [$($selectedProdPolicy.Id)]" -ForegroundColor White
-
-            $groupLookup = Get-GroupMemberUserIds -GroupIds $prodTargetGroupIds
-            $expectedUserIds = $groupLookup.UserIds
-            $expectedGroups = $groupLookup.Groups
-
-            Write-Host "Found $($expectedGroups.Count) target groups with $($expectedUserIds.Count) unique users to exclude as expected impact." -ForegroundColor Green
-            $expectedGroups | ForEach-Object {
-                Write-Host "  - $($_.GroupName) [$($_.GroupId)]" -ForegroundColor Gray
+            if ($matchedProdPolicies.Count -eq 1) {
+                $selectedProdPolicy = $matchedProdPolicies[0]
+            } elseif ($matchedProdPolicies.Count -gt 1) {
+                Write-Host "Multiple enabled prod policies matched '$ProdPolicy'. Using the first match: $($matchedProdPolicies[0].DisplayName)" -ForegroundColor Yellow
+                $selectedProdPolicy = $matchedProdPolicies[0]
+            } else {
+                Write-Host "No enabled prod policy matched '$ProdPolicy'. No expected-user exclusion will be applied." -ForegroundColor Yellow
             }
         } else {
-            Write-Host "Prod policy '$($selectedProdPolicy.DisplayName)' has no explicit include groups. No expected-user exclusion will be applied." -ForegroundColor Yellow
+            $fourGroupCandidates = @($prodPolicies | Where-Object { @($_.Conditions.Users.IncludeGroups).Count -eq 4 })
+            if ($fourGroupCandidates.Count -ge 1) {
+                $selectedProdPolicy = $fourGroupCandidates[0]
+            } elseif ($prodPolicies.Count -eq 1) {
+                $selectedProdPolicy = $prodPolicies[0]
+            }
         }
-    } else {
-        Write-Host "`nNo prod policy was auto-resolved for expected-user exclusion. Run with -ProdPolicy to force a specific enabled policy." -ForegroundColor Yellow
+
+        if ($selectedProdPolicy) {
+            $prodTargetGroupIds = @($selectedProdPolicy.Conditions.Users.IncludeGroups | Where-Object { $_ -and $_ -ne 'All' })
+            if ($prodTargetGroupIds.Count -gt 0) {
+                Write-Host "`nResolving expected impacted users from prod policy group targets..." -ForegroundColor Cyan
+                Write-Host "Prod policy: $($selectedProdPolicy.DisplayName) [$($selectedProdPolicy.Id)]" -ForegroundColor White
+
+                $groupLookup = Get-GroupMemberUserIds -GroupIds $prodTargetGroupIds
+                $expectedUserIds = $groupLookup.UserIds
+                $expectedGroups = $groupLookup.Groups
+
+                Write-Host "Found $($expectedGroups.Count) target groups with $($expectedUserIds.Count) unique users to exclude as expected impact." -ForegroundColor Green
+                $expectedGroups | ForEach-Object {
+                    Write-Host "  - $($_.GroupName) [$($_.GroupId)]" -ForegroundColor Gray
+                }
+            } else {
+                Write-Host "Prod policy '$($selectedProdPolicy.DisplayName)' has no explicit include groups. No expected-user exclusion will be applied." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "`nNo prod policy was auto-resolved for expected-user exclusion. Run with -ProdPolicy to force a specific enabled policy." -ForegroundColor Yellow
+        }
     }
 }
 

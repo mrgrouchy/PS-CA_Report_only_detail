@@ -66,6 +66,12 @@ Run all matching report-only policies without prompt:
 .\CA_report.ps1 -AllPolicies
 ```
 
+Run with groups ignored (do not exclude expected-impact users):
+
+```powershell
+.\CA_report.ps1 -All
+```
+
 ## Expected-Impact Exclusion
 
 The script excludes users who are already expected to be impacted by production targeting:
@@ -74,6 +80,7 @@ The script excludes users who are already expected to be impacted by production 
 2. Otherwise, the script falls back to:
    - `-ProdPolicy` (if provided), or
    - auto-discovery of an enabled risk/MFA policy (prefers one with 4 include groups).
+3. If `-All` is specified, group-based exclusion is skipped and all impacted users are included.
 
 To hardcode your 4 production target groups, edit this block in `CA_report.ps1`:
 
