@@ -1,43 +1,36 @@
 <#
 .SYNOPSIS
-Analyzes unexpected user impact from report-only Conditional Access risk/MFA policies.
+WIP script to evaluate report-only Conditional Access MFA/risk impact.
 
 .DESCRIPTION
-Connects to Microsoft Graph, reads report-only Conditional Access policies, correlates
-them with recent sign-in activity, and exports detailed CSV reports that show where MFA
-would have been required if those policies were enforced. Users already included in the
-enabled production policy target groups are excluded so outputs focus on unexpected impact.
+Early/in-progress utility. Behavior and parameters may change.
 
 .EXAMPLE
 PS> .\CA_report.ps1
-Prompts you to choose a target report-only policy (or all), runs the analysis for the
-last 30 days, auto-detects the enabled production policy with 4 target groups when
-possible, and exports CSV reports to the current directory.
-
-.EXAMPLE
-PS> pwsh -ExecutionPolicy Bypass -File .\CA_report.ps1
-Runs the same analysis from a PowerShell host where script execution policy is restricted.
-
-.EXAMPLE
-PS> .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins"
-Runs analysis for the specified report-only policy name (or policy ID) without interactive
-selection.
-
-.EXAMPLE
-PS> .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins" -ProdPolicy "Prod - Sign-in Risk - MFA"
-Runs analysis against a specific report-only policy and explicitly uses the named enabled
-production policy to resolve expected-user exclusions from its target groups.
+Runs the current draft workflow.
 
 .NOTES
 Required Microsoft Graph scopes: AuditLog.Read.All, Policy.Read.All, Group.Read.All
+When using -UseLogAnalytics, ensure Az.Accounts and Az.OperationalInsights are installed
+and that your account has permission to query the target workspace.
 #>
 
 param(
     [string]$TargetPolicy,
     [switch]$AllPolicies,
     [string]$ProdPolicy,
-    [switch]$All
+    [switch]$All,
+    [switch]$UseLogAnalytics,
+    [string]$LogAnalyticsWorkspaceId,
+    [switch]$NoGroupCheck,
+    [switch]$UseGraphAPI,
+    [switch]$SimpleCA002ATest
 )
+
+# Default to Log Analytics (the working path from -SimpleCA002ATest)
+if (-not $UseGraphAPI) {
+    $UseLogAnalytics = $true
+}
 
 # Hardcode expected-impact group IDs here (recommended: object IDs, not names).
 # If populated, these groups take precedence over -ProdPolicy/auto-discovery.
@@ -48,11 +41,67 @@ $HardcodedExpectedGroupIds = @(
     # "00000000-0000-0000-0000-000000000004"
 )
 
-# Connect with required permissions
-Connect-MgGraph -Scopes "AuditLog.Read.All", "Policy.Read.All", "Group.Read.All"
+# Hardcoded Log Analytics workspace (redacted)
+$WorkspaceId = "00000000-0000-0000-0000-000000000000"
+
+# ------------------------------------------------------------
+# Graph connection
+# ------------------------------------------------------------
+
+$TenantId  = "00000000-0000-0000-0000-000000000000"
+$ClientId  = "00000000-0000-0000-0000-000000000000"
+$Thumbprint = "0000000000000000000000000000000000000000"   # cert must exist in CurrentUser\My or LocalMachine\My
+
+function Test-GraphConnectivity {
+  try {
+    Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$top=1&`$select=id" -Method GET -ErrorAction Stop | Out-Null
+    return $true
+  }
+  catch {
+    return $false
+  }
+}
+
+$usingExistingGraph = $false
+try {
+  $ctx = Get-MgContext -ErrorAction Stop
+  if ($ctx -and $ctx.Account -and (Test-GraphConnectivity)) {
+    $usingExistingGraph = $true
+    Write-Host "Using existing Microsoft Graph session: $($ctx.Account) ($($ctx.TenantId))" -ForegroundColor DarkGray
+  }
+}
+catch {
+  $usingExistingGraph = $false
+}
+
+if (-not $usingExistingGraph) {
+  $hasAppAuthConfig = (-not [string]::IsNullOrWhiteSpace($TenantId)) -and
+                      (-not [string]::IsNullOrWhiteSpace($ClientId)) -and
+                      (-not [string]::IsNullOrWhiteSpace($Thumbprint))
+
+  if ($hasAppAuthConfig) {
+    Write-Host "No active Graph session found. Connecting with app certificate auth..." -ForegroundColor Cyan
+    Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Thumbprint -NoWelcome
+  }
+  else {
+    Write-Host "No active Graph session found and app auth values are empty. Using interactive Graph sign-in for testing..." -ForegroundColor Cyan
+    Connect-MgGraph -Scopes "AuditLog.Read.All", "Policy.Read.All", "Group.Read.All" -NoWelcome
+  }
+}
+
+# Verify Graph connection is established before proceeding
+$finalContext = Get-MgContext -ErrorAction Stop
+if (-not $finalContext -or (-not $finalContext.Account -and -not $finalContext.ClientId)) {
+  Write-Host "ERROR: Microsoft Graph connection failed or was not established. Exiting." -ForegroundColor Red
+  exit 1
+}
+
+$authType = if ($finalContext.AuthType -eq 'AppOnly') { "AppOnly (Certificate)" } else { $finalContext.AuthType }
+$accountDisplay = if ($finalContext.Account) { $finalContext.Account } else { $finalContext.ClientId }
+Write-Host "Graph connection verified: $accountDisplay / Tenant: $($finalContext.TenantId) / Auth: $authType" -ForegroundColor Green
 
 # Define time range for analysis (adjust as needed)
-$startDate = (Get-Date).AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ssZ")
+$startDate = (Get-Date).AddDays(-2).ToString("yyyy-MM-ddTHH:mm:ssZ")
 $endDate = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
 
 function Get-SafePercentage {
@@ -113,9 +162,103 @@ function Get-GroupMemberUserIds {
     }
 }
 
+function Convert-JsonIfString {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value,
+        [switch]$AsArray,
+        [switch]$AsObject
+    )
+
+    if ($null -eq $Value) {
+        if ($AsArray) { return @() }
+        if ($AsObject) { return [PSCustomObject]@{} }
+        return $null
+    }
+
+    $parsed = $Value
+    if ($Value -is [string]) {
+        try {
+            $parsed = $Value | ConvertFrom-Json -Depth 20
+        } catch {
+            $parsed = $Value
+        }
+    }
+
+    if ($AsArray) {
+        if ($parsed -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($parsed)) {
+                return @()
+            }
+            return @($parsed)
+        }
+        return @($parsed)
+    }
+
+    if ($AsObject) {
+        if ($parsed -is [string]) {
+            return [PSCustomObject]@{}
+        }
+        return $parsed
+    }
+
+    return $parsed
+}
+
+function Convert-LogAnalyticsSignIn {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Record
+    )
+
+    [PSCustomObject]@{
+        createdDateTime = if ($Record.createdDateTime) { $Record.createdDateTime } else { $Record.CreatedDateTime }
+        userPrincipalName = if ($Record.userPrincipalName) { $Record.userPrincipalName } else { $Record.UserPrincipalName }
+        userDisplayName = if ($Record.userDisplayName) { $Record.userDisplayName } else { $Record.UserDisplayName }
+        userId = if ($Record.userId) { $Record.userId } else { $Record.UserId }
+
+        appliedConditionalAccessPolicies = Convert-JsonIfString -Value $(if ($Record.appliedConditionalAccessPolicies) { $Record.appliedConditionalAccessPolicies } else { $Record.ConditionalAccessPolicies }) -AsArray
+        riskLevelDuringSignIn = if ($Record.riskLevelDuringSignIn) { $Record.riskLevelDuringSignIn } else { $Record.RiskLevelDuringSignIn }
+        userRiskLevel = if ($Record.userRiskLevel) { $Record.userRiskLevel } else { $Record.UserRiskLevel }
+        riskState = if ($Record.riskState) { $Record.riskState } else { $Record.RiskState }
+        riskEventTypes_v2 = Convert-JsonIfString -Value $(if ($Record.riskEventTypes_v2) { $Record.riskEventTypes_v2 } else { $Record.RiskEventTypes_V2 }) -AsArray
+        riskDetail = if ($Record.riskDetail) { $Record.riskDetail } else { $Record.RiskDetail }
+
+        authenticationMethodsUsed = Convert-JsonIfString -Value $(if ($Record.authenticationMethodsUsed) { $Record.authenticationMethodsUsed } else { $Record.AuthenticationMethodsUsed }) -AsArray
+        authenticationRequirement = if ($Record.authenticationRequirement) { $Record.authenticationRequirement } else { $Record.AuthenticationRequirement }
+
+        appDisplayName = if ($Record.appDisplayName) { $Record.appDisplayName } else { $Record.AppDisplayName }
+        appId = if ($Record.appId) { $Record.appId } else { $Record.AppId }
+        resourceDisplayName = if ($Record.resourceDisplayName) { $Record.resourceDisplayName } else { $Record.ResourceDisplayName }
+
+        deviceDetail = Convert-JsonIfString -Value $(if ($Record.deviceDetail) { $Record.deviceDetail } else { $Record.DeviceDetail }) -AsObject
+        location = Convert-JsonIfString -Value $(if ($Record.location) { $Record.location } else { $Record.Location }) -AsObject
+
+        ipAddress = if ($Record.ipAddress) { $Record.ipAddress } else { $Record.IPAddress }
+        clientAppUsed = if ($Record.clientAppUsed) { $Record.clientAppUsed } else { $Record.ClientAppUsed }
+        isInteractive = if ($null -ne $Record.isInteractive) { $Record.isInteractive } else { $Record.IsInteractive }
+
+        status = Convert-JsonIfString -Value $(if ($Record.status) { $Record.status } else { $Record.Status }) -AsObject
+        correlationId = if ($Record.correlationId) { $Record.correlationId } else { $Record.CorrelationId }
+        id = if ($Record.id) { $Record.id } else { $Record.Id }
+
+        matchedPolicyId = if ($Record.matchedPolicyId) { $Record.matchedPolicyId } else { $Record.MatchedPolicyId }
+        matchedPolicyResult = if ($Record.matchedPolicyResult) { $Record.matchedPolicyResult } else { $Record.MatchedPolicyResult }
+        matchedPolicyDisplayName = if ($Record.matchedPolicyDisplayName) { $Record.matchedPolicyDisplayName } else { $Record.MatchedPolicyDisplayName }
+    }
+}
+
 Write-Host "=== SIGN-IN RISK & MFA REQUIREMENT ANALYSIS ===" -ForegroundColor Cyan
 Write-Host "Analyzing report-only CA policies for sign-in risk and MFA impact..." -ForegroundColor Yellow
-Write-Host "Date range: $((Get-Date).AddDays(-30).ToString('yyyy-MM-dd')) to $((Get-Date).ToString('yyyy-MM-dd'))`n" -ForegroundColor Yellow
+Write-Host "Date range: $((Get-Date).AddDays(-2).ToString('yyyy-MM-dd')) to $((Get-Date).ToString('yyyy-MM-dd'))`n" -ForegroundColor Yellow
+
+if ($SimpleCA002ATest) {
+    $TargetPolicy = "CA002A - All apps All Users: Require MFA when High or Medium User sign-in risk"
+    $AllPolicies = $false
+    $NoGroupCheck = $true
+    $UseLogAnalytics = $true
+    Write-Host "Simple test mode enabled: CA002A, last 48 hours, reportOnlyInterrupted only, no group exclusion." -ForegroundColor Yellow
+}
 
 # Fetch all CA policies to identify risk-based ones
 Write-Host "Fetching Conditional Access policies..." -ForegroundColor Cyan
@@ -129,10 +272,12 @@ do {
 
 $reportOnlyPolicies = $caPolicies | Where-Object { $_.State -eq 'enabledForReportingButNotEnforced' }
 
-# Identify risk-based policies
+# Identify risk-based policies (sign-in risk, user risk, or MFA/passwordChange grant controls)
 $riskPolicies = $reportOnlyPolicies | Where-Object {
     $_.Conditions.SignInRiskLevels.Count -gt 0 -or
-    $_.GrantControls.BuiltInControls -contains 'mfa'
+    $_.Conditions.UserRiskLevels.Count -gt 0 -or
+    $_.GrantControls.BuiltInControls -contains 'mfa' -or
+    $_.GrantControls.BuiltInControls -contains 'passwordChange'
 } | Sort-Object DisplayName
 
 $riskPolicies = @($riskPolicies)
@@ -145,7 +290,8 @@ Write-Host "Found $($riskPolicies.Count) report-only policies with risk/MFA cond
 $riskPolicies | ForEach-Object {
     Write-Host "  - $($_.DisplayName)" -ForegroundColor White
     Write-Host "    Sign-in risk levels: $(($_.Conditions.SignInRiskLevels -join ', '))" -ForegroundColor Gray
-    Write-Host "    Grant controls: $(($_.GrantControls.BuiltInControls -join ', '))" -ForegroundColor Gray
+    Write-Host "    User risk levels:    $(($_.Conditions.UserRiskLevels -join ', '))" -ForegroundColor Gray
+    Write-Host "    Grant controls:      $(($_.GrantControls.BuiltInControls -join ', '))" -ForegroundColor Gray
 }
 
 # Select target policy/policies
@@ -195,13 +341,17 @@ $targetPolicies | ForEach-Object { Write-Host "  - $($_.DisplayName) [$($_.Id)]"
 $prodPolicies = $caPolicies | Where-Object {
     $_.State -eq 'enabled' -and (
         $_.Conditions.SignInRiskLevels.Count -gt 0 -or
-        $_.GrantControls.BuiltInControls -contains 'mfa'
+        $_.Conditions.UserRiskLevels.Count -gt 0 -or
+        $_.GrantControls.BuiltInControls -contains 'mfa' -or
+        $_.GrantControls.BuiltInControls -contains 'passwordChange'
     )
 }
 
 $expectedUserIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $expectedGroups = @()
-if ($All) {
+if ($NoGroupCheck) {
+    Write-Host "`n-NoGroupCheck specified. Skipping group-based expected-user exclusion." -ForegroundColor Yellow
+} elseif ($All) {
     Write-Host "`n-All switch specified. Group-based expected-user exclusion is disabled." -ForegroundColor Yellow
 } else {
     $hardcodedGroupIds = @($HardcodedExpectedGroupIds | Where-Object { $_ -and $_ -ne 'All' })
@@ -269,84 +419,189 @@ if ($All) {
 Write-Host "`nFetching sign-in logs (this may take several minutes)..." -ForegroundColor Cyan
 
 $allSignIns = @()
-$uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $startDate and createdDateTime le $endDate&`$top=999"
-
-do {
-    $response = Invoke-MgGraphRequest -Uri $uri -Method GET
-    $signIns = $response.value
-
-    # Filter for sign-ins with report-only policy results AND risk or MFA relevance
-    $relevantSignIns = $signIns | Where-Object {
-        ($_.appliedConditionalAccessPolicies | Where-Object {
-            $_.result -in @('reportOnlySuccess', 'reportOnlyFailure') -and
-            $_.id -in $targetPolicyIds
-        }) -or
-        $_.riskLevelDuringSignIn -in @('low', 'medium', 'high')
+if ($UseLogAnalytics) {
+    $queryWorkspaceId = if ($LogAnalyticsWorkspaceId) { $LogAnalyticsWorkspaceId } else { $WorkspaceId }
+    if (-not $queryWorkspaceId) {
+        Write-Host "-UseLogAnalytics requires -LogAnalyticsWorkspaceId or a hardcoded \$WorkspaceId. Exiting." -ForegroundColor Red
+        return
     }
 
-    $allSignIns += $relevantSignIns
+    if (-not (Get-Command Invoke-AzOperationalInsightsQuery -ErrorAction SilentlyContinue)) {
+        Write-Host "Invoke-AzOperationalInsightsQuery is not available. Install/import Az.OperationalInsights and retry." -ForegroundColor Red
+        return
+    }
 
-    Write-Host "  Fetched $($allSignIns.Count) relevant sign-ins..." -ForegroundColor Yellow
+    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+        Write-Host "Connecting to Azure for Log Analytics query..." -ForegroundColor Cyan
+        Connect-AzAccount -ErrorAction Stop | Out-Null
+    }
 
-    $uri = $response.'@odata.nextLink'
-} while ($uri)
+    # --- Pre-flight: verify Az connectivity and workspace reachability ---
+    Write-Host "  Verifying Azure context and Log Analytics workspace connectivity..." -ForegroundColor Cyan
+    try {
+        $azCtx = Get-AzContext -ErrorAction Stop
+        Write-Host "  Azure context OK: $($azCtx.Account) / Subscription: $($azCtx.Subscription.Name) [$($azCtx.Subscription.Id)]" -ForegroundColor Green
+    } catch {
+        Write-Host "  ERROR: Could not retrieve Azure context. Run Connect-AzAccount and retry." -ForegroundColor Red
+        return
+    }
+    try {
+            Write-Host "  Checking Log Analytics workspace access..." -ForegroundColor DarkCyan
+        $null = Invoke-AzOperationalInsightsQuery -WorkspaceId $queryWorkspaceId -Query "search * | take 1" -ErrorAction Stop
+        Write-Host "  Log Analytics workspace '$queryWorkspaceId' is reachable." -ForegroundColor Green
+    } catch {
+        Write-Host "  ERROR: Cannot reach Log Analytics workspace '$queryWorkspaceId'." -ForegroundColor Red
+        Write-Host "  Details: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  Check that the workspace ID is correct and that '$($azCtx.Account)' has the Reader role on it." -ForegroundColor Yellow
+        return
+    }
+    # --- End pre-flight ---
+
+    # Build policy ID list for KQL in() operator (single-quoted, comma-separated)
+    $quotedPolicyIds = @($targetPolicyIds | Where-Object { $_ } | ForEach-Object { "'$_'" })
+    if ($quotedPolicyIds.Count -eq 0) {
+        $quotedPolicyIds = @("'__NO_POLICY_IDS__'")
+    }
+    $policyIdList = $quotedPolicyIds -join ", "
+
+    Write-Host "  Preparing Log Analytics query for $($targetPolicyIds.Count) target policy/policies..." -ForegroundColor Cyan
+    Write-Host "  Query window: $startDate to $endDate" -ForegroundColor DarkCyan
+
+    # Split long ranges into smaller chunks to avoid Az.OperationalInsights client timeout (100s default).
+    $chunkHours = 6
+    $windowStart = [datetime]::Parse($startDate)
+    $windowEnd = [datetime]::Parse($endDate)
+    $laRows = @()
+
+    Write-Host "  Running Log Analytics query in $chunkHours-hour chunks..." -ForegroundColor Cyan
+    $chunkStart = $windowStart
+    while ($chunkStart -lt $windowEnd) {
+        $chunkEnd = $chunkStart.AddHours($chunkHours)
+        if ($chunkEnd -gt $windowEnd) { $chunkEnd = $windowEnd }
+
+        $chunkStartText = $chunkStart.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $chunkEndText = $chunkEnd.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+        # Use mv-expand to reliably filter on the per-policy result inside the dynamic array.
+        # Filter: reportOnlyInterrupted only (Report-only: User action required)
+        $kql = @"
+SigninLogs
+| where TimeGenerated >= datetime($chunkStartText) and TimeGenerated < datetime($chunkEndText)
+| where ConditionalAccessPolicies != "[]"
+| mv-expand cap = ConditionalAccessPolicies
+| where tostring(cap["id"]) in ($policyIdList)
+| extend capResult = tostring(cap["result"])
+| where capResult == "reportOnlyInterrupted"
+| extend matchedPolicyId = tostring(cap["id"]),
+         matchedPolicyResult = capResult,
+         matchedPolicyDisplayName = tostring(cap["displayName"])
+| summarize arg_max(TimeGenerated, *) by CorrelationId
+"@
+
+        Write-Host "    Querying chunk: $chunkStartText -> $chunkEndText" -ForegroundColor DarkCyan
+        try {
+            $laResponse = Invoke-AzOperationalInsightsQuery -WorkspaceId $queryWorkspaceId -Query $kql -ErrorAction Stop
+            $chunkRows = @($laResponse.Results)
+            $laRows += $chunkRows
+            Write-Host "      Returned $($chunkRows.Count) rows (running total: $($laRows.Count))." -ForegroundColor Gray
+        } catch {
+            Write-Host "  ERROR: Log Analytics chunk query failed for $chunkStartText -> $chunkEndText" -ForegroundColor Red
+            Write-Host "  Details: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  Try a shorter lookback window while testing." -ForegroundColor Yellow
+            return
+        }
+
+        $chunkStart = $chunkEnd
+    }
+
+    Write-Host "  Query complete. Returned $($laRows.Count) sign-in rows across all chunks." -ForegroundColor Green
+
+    Write-Host "  Converting Log Analytics rows into report objects..." -ForegroundColor Cyan
+    foreach ($row in $laRows) {
+        $allSignIns += Convert-LogAnalyticsSignIn -Record $row
+    }
+
+    # KQL already filtered to reportOnlyInterrupted for target policies,
+    # but re-filter in PowerShell to be safe after JSON deserialisation.
+    Write-Host "  Applying final in-memory policy/result filter..." -ForegroundColor DarkCyan
+    $allSignIns = @(
+        $allSignIns | Where-Object {
+            $caps = @($_.appliedConditionalAccessPolicies)
+            (($_.matchedPolicyResult -eq 'reportOnlyInterrupted') -and ($_.matchedPolicyId -in $targetPolicyIds)) -or
+            (@($caps | Where-Object { $_.result -eq 'reportOnlyInterrupted' -and $_.id -in $targetPolicyIds }).Count -gt 0)
+        }
+    )
+    Write-Host "  Fetched $($allSignIns.Count) relevant sign-ins from Log Analytics (user action required)." -ForegroundColor Yellow
+}
+else {
+    $signInSelect = "id,createdDateTime,userPrincipalName,userDisplayName,userId,appliedConditionalAccessPolicies,riskLevelDuringSignIn,userRiskLevel,riskState,riskEventTypes_v2,riskDetail,authenticationMethodsUsed,authenticationRequirement,appDisplayName,appId,resourceDisplayName,deviceDetail,location,ipAddress,clientAppUsed,isInteractive,status,correlationId"
+    $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $startDate and createdDateTime le $endDate&`$top=999&`$select=$signInSelect"
+
+    do {
+        $response = Invoke-MgGraphRequest -Uri $uri -Method GET
+        $signIns = $response.value
+
+        # Keep only sign-ins where report-only result is "User action required".
+        # reportOnlyInterrupted = "Report-only: User action required"
+        $relevantSignIns = $signIns | Where-Object {
+            $caps = @($_.appliedConditionalAccessPolicies)
+            @($caps | Where-Object { $_.result -eq 'reportOnlyInterrupted' -and $_.id -in $targetPolicyIds }).Count -gt 0
+        }
+
+        $allSignIns += $relevantSignIns
+
+        Write-Host "  Fetched $($allSignIns.Count) relevant sign-ins..." -ForegroundColor Yellow
+
+        $uri = $response.'@odata.nextLink'
+    } while ($uri)
+}
 
 Write-Host "Total sign-ins with risk/MFA policy evaluation: $($allSignIns.Count)`n" -ForegroundColor Green
 
 # Build detailed MFA requirement report
 Write-Host "Analyzing MFA challenges and risk-based requirements..." -ForegroundColor Cyan
 
-$mfaImpactReport = foreach ($signIn in $allSignIns) {
-    # Get report-only policy evaluations
-    $matchedPolicies = $signIn.appliedConditionalAccessPolicies | Where-Object {
-        $_.result -in @('reportOnlySuccess', 'reportOnlyFailure') -and
+$mfaImpactReport = @(
+foreach ($signIn in $allSignIns) {
+    # Get only policies with report-only user action required.
+    # reportOnlyInterrupted = Report-only: User action required
+    $matchedPolicies = @($signIn.appliedConditionalAccessPolicies | Where-Object {
+        $_.result -eq 'reportOnlyInterrupted' -and
         $_.id -in $targetPolicyIds
-    }
+    })
 
-    # If no policies matched, but there was risk, create a synthetic entry
-    if (-not $matchedPolicies -and $signIn.riskLevelDuringSignIn -in @('low', 'medium', 'high')) {
+    if ($matchedPolicies.Count -eq 0 -and $signIn.matchedPolicyResult -eq 'reportOnlyInterrupted' -and $signIn.matchedPolicyId -in $targetPolicyIds) {
+        $matchedDisplayName = if ($signIn.matchedPolicyDisplayName) {
+            $signIn.matchedPolicyDisplayName
+        } else {
+            ($targetPolicies | Where-Object { $_.Id -eq $signIn.matchedPolicyId } | Select-Object -First 1 -ExpandProperty DisplayName)
+        }
+
         $matchedPolicies = @([PSCustomObject]@{
-            displayName = "No policy (risk detected)"
-            id = "N/A"
-            result = "riskDetectedNoPolicy"
+            id = $signIn.matchedPolicyId
+            result = $signIn.matchedPolicyResult
+            displayName = $matchedDisplayName
         })
     }
 
+    if ($matchedPolicies.Count -eq 0) { continue }
+
     foreach ($policy in $matchedPolicies) {
-        # Determine MFA requirement status
-        $mfaRequired = "No"
-        $reason = ""
+        # Determine outcome label based on report-only result.
         $riskLevel = $signIn.riskLevelDuringSignIn
+        $userRiskLevel = $signIn.userRiskLevel
         $riskState = $signIn.riskState
-
-        if ($policy.result -eq 'reportOnlyFailure') {
-            $mfaRequired = "Yes - Would Challenge"
-
-            # Determine the reason for MFA requirement
-            if ($riskLevel -in @('high', 'medium', 'low')) {
-                $reason = "Sign-in risk detected: $riskLevel"
-            } else {
-                $reason = "Policy requires MFA"
-            }
+        $mfaRequired = if ($policy.result -eq 'reportOnlyInterrupted') {
+            "Yes - User Action Required"
+        } else {
+            "Yes - Would Block"
         }
-        elseif ($policy.result -eq 'reportOnlySuccess') {
-            # Check if MFA was already satisfied
-            if ($signIn.authenticationRequirement -eq 'multiFactorAuthentication') {
-                $mfaRequired = "No - Already Completed MFA"
-                $reason = "User already performed MFA for this session"
-            }
-            elseif ($riskLevel -eq 'none' -or $null -eq $riskLevel) {
-                $mfaRequired = "No - No Risk Detected"
-                $reason = "Sign-in risk is none"
-            }
-            else {
-                $mfaRequired = "No - Risk Accepted"
-                $reason = "Risk level $riskLevel but policy passed"
-            }
-        }
-        elseif ($policy.result -eq 'riskDetectedNoPolicy') {
-            $mfaRequired = "Risk Present - No Policy"
-            $reason = "Risk detected but no report-only policy evaluated"
+        $reason = if ($riskLevel -in @('high', 'medium', 'low')) {
+            "Sign-in risk detected: $riskLevel"
+        } elseif ($userRiskLevel -in @('high', 'medium', 'low')) {
+            "User risk detected: $userRiskLevel"
+        } else {
+            "Policy requires MFA (grant control not satisfied)"
         }
 
         # Determine specific risk types
@@ -368,6 +623,7 @@ $mfaImpactReport = foreach ($signIn in $allSignIns) {
 
             # Risk Details
             SignInRiskLevel = if ($riskLevel) { $riskLevel } else { "none" }
+            UserRiskLevel = if ($userRiskLevel) { $userRiskLevel } else { "none" }
             SignInRiskState = if ($riskState) { $riskState } else { "none" }
             RiskDetectionTypes = $riskTypes
             RiskDetail = $signIn.riskDetail
@@ -412,9 +668,13 @@ $mfaImpactReport = foreach ($signIn in $allSignIns) {
             # Identifiers
             CorrelationId = $signIn.correlationId
             SignInId = $signIn.id
+
+            # Scope Check
+            IsMemberOfExpectedGroups = if ($expectedUserIds.Count -gt 0 -and $signIn.userId -and $expectedUserIds.Contains($signIn.userId)) { 'Yes' } else { 'No' }
         }
     }
 }
+)
 
 # Keep only unexpected impact users (exclude users already targeted by prod policy groups)
 if ($expectedUserIds.Count -gt 0) {
@@ -432,202 +692,4 @@ if ($expectedUserIds.Count -gt 0) {
 
 # Export detailed report
 $mfaImpactReport | Export-Csv -Path "CA_SignInRisk_MFA_Impact_Detail.csv" -NoTypeInformation
-Write-Host "Detailed MFA impact report exported to: CA_SignInRisk_MFA_Impact_Detail.csv" -ForegroundColor Green
-
-# === EXECUTIVE SUMMARY: MFA CHALLENGE VOLUME ===
-Write-Host "`n=== EXECUTIVE SUMMARY: MFA CHALLENGE IMPACT ===" -ForegroundColor Magenta
-
-$mfaChallenges = $mfaImpactReport | Where-Object { $_.WouldRequireMFA -eq 'Yes - Would Challenge' }
-$totalSignIns = $mfaImpactReport.Count
-$uniqueUsersChallenged = ($mfaChallenges | Select-Object -Unique UserPrincipalName).Count
-$totalUsers = ($mfaImpactReport | Select-Object -Unique UserPrincipalName).Count
-
-Write-Host "`nTenant-Wide Impact:" -ForegroundColor Yellow
-Write-Host "  Total sign-ins analyzed: $totalSignIns" -ForegroundColor White
-Write-Host "  Sign-ins that would trigger MFA: $($mfaChallenges.Count) ($(Get-SafePercentage -Numerator $mfaChallenges.Count -Denominator $totalSignIns)%)" -ForegroundColor White
-Write-Host "  Unique users who would be challenged: $uniqueUsersChallenged of $totalUsers ($(Get-SafePercentage -Numerator $uniqueUsersChallenged -Denominator $totalUsers)%)" -ForegroundColor White
-
-# MFA Challenge breakdown by risk level
-$riskLevelBreakdown = $mfaChallenges | Group-Object SignInRiskLevel | ForEach-Object {
-    [PSCustomObject]@{
-        RiskLevel = $_.Name
-        Challenges = $_.Count
-        Percentage = Get-SafePercentage -Numerator $_.Count -Denominator $mfaChallenges.Count
-        UniqueUsers = ($_.Group | Select-Object -Unique UserPrincipalName).Count
-    }
-} | Sort-Object @{Expression={
-    switch($_.RiskLevel) {
-        'high' {3}
-        'medium' {2}
-        'low' {1}
-        default {0}
-    }
-}} -Descending
-
-Write-Host "`nMFA Challenges by Risk Level:" -ForegroundColor Yellow
-$riskLevelBreakdown | Format-Table RiskLevel, Challenges, Percentage, UniqueUsers -AutoSize
-
-# Export risk level summary
-$riskLevelBreakdown | Export-Csv -Path "CA_SignInRisk_MFA_By_RiskLevel.csv" -NoTypeInformation
-
-# === USER IMPACT ANALYSIS ===
-Write-Host "`nGenerating user impact analysis..." -ForegroundColor Cyan
-
-$userImpact = $mfaImpactReport | Group-Object UserPrincipalName | ForEach-Object {
-    $userSignIns = $_.Group
-    $userChallenges = $userSignIns | Where-Object { $_.WouldRequireMFA -eq 'Yes - Would Challenge' }
-
-    if ($userChallenges.Count -gt 0) {
-        # Get risk breakdown for this user
-        $highRisk = ($userChallenges | Where-Object { $_.SignInRiskLevel -eq 'high' }).Count
-        $mediumRisk = ($userChallenges | Where-Object { $_.SignInRiskLevel -eq 'medium' }).Count
-        $lowRisk = ($userChallenges | Where-Object { $_.SignInRiskLevel -eq 'low' }).Count
-
-        # Get most common risk types
-        $commonRiskTypes = $userChallenges | Where-Object { $_.RiskDetectionTypes -ne 'None' } |
-            ForEach-Object { $_.RiskDetectionTypes -split '; ' } |
-            Group-Object | Sort-Object Count -Descending | Select-Object -First 3 -ExpandProperty Name
-
-        [PSCustomObject]@{
-            UserPrincipalName = $_.Name
-            UserDisplayName = ($userSignIns | Select-Object -First 1).UserDisplayName
-
-            TotalSignIns = $userSignIns.Count
-            MFAChallenges = $userChallenges.Count
-            ChallengeRate = [math]::Round(($userChallenges.Count / $userSignIns.Count) * 100, 2)
-
-            HighRiskSignIns = $highRisk
-            MediumRiskSignIns = $mediumRisk
-            LowRiskSignIns = $lowRisk
-
-            MostCommonRiskTypes = ($commonRiskTypes -join '; ')
-
-            UniqueAppsAffected = ($userChallenges | Select-Object -Unique AppDisplayName).Count
-            TopApps = (($userChallenges | Group-Object AppDisplayName |
-                Sort-Object Count -Descending | Select-Object -First 3).Name -join '; ')
-
-            UniqueLocations = ($userChallenges | Select-Object -Unique Country).Count
-            Countries = (($userChallenges | Select-Object -Unique Country).Country -join '; ')
-
-            AlreadyUsesMFA = if ($userSignIns | Where-Object { $_.MFAAlreadyUsed -eq 'Yes' }) { 'Yes' } else { 'No' }
-            MFAUsageRate = [math]::Round((($userSignIns | Where-Object { $_.MFAAlreadyUsed -eq 'Yes' }).Count / $userSignIns.Count) * 100, 2)
-
-            FirstChallenge = ($userChallenges | Sort-Object Timestamp | Select-Object -First 1).Timestamp
-            LastChallenge = ($userChallenges | Sort-Object Timestamp | Select-Object -Last 1).Timestamp
-        }
-    }
-} | Where-Object { $_ } | Sort-Object MFAChallenges -Descending
-
-$userImpact | Export-Csv -Path "CA_SignInRisk_MFA_User_Impact.csv" -NoTypeInformation
-Write-Host "User impact analysis exported to: CA_SignInRisk_MFA_User_Impact.csv" -ForegroundColor Green
-
-Write-Host "`n=== TOP 20 USERS WHO WOULD BE CHALLENGED ===" -ForegroundColor Magenta
-$userImpact | Select-Object -First 20 |
-    Format-Table UserPrincipalName, TotalSignIns, MFAChallenges, ChallengeRate,
-    HighRiskSignIns, MediumRiskSignIns, AlreadyUsesMFA -AutoSize
-
-# === RISK TYPE ANALYSIS ===
-Write-Host "`nAnalyzing risk detection types..." -ForegroundColor Cyan
-
-$riskTypeAnalysis = $mfaChallenges | Where-Object { $_.RiskDetectionTypes -ne 'None' } |
-    ForEach-Object {
-        $signIn = $_
-        $_.RiskDetectionTypes -split '; ' | ForEach-Object {
-            [PSCustomObject]@{
-                RiskType = $_
-                UserPrincipalName = $signIn.UserPrincipalName
-                RiskLevel = $signIn.SignInRiskLevel
-                Country = $signIn.Country
-                Timestamp = $signIn.Timestamp
-            }
-        }
-    } | Group-Object RiskType | ForEach-Object {
-    [PSCustomObject]@{
-        RiskDetectionType = $_.Name
-        Occurrences = $_.Count
-        UniqueUsers = ($_.Group | Select-Object -Unique UserPrincipalName).Count
-        HighRiskCount = ($_.Group | Where-Object { $_.RiskLevel -eq 'high' }).Count
-        MediumRiskCount = ($_.Group | Where-Object { $_.RiskLevel -eq 'medium' }).Count
-        LowRiskCount = ($_.Group | Where-Object { $_.RiskLevel -eq 'low' }).Count
-        TopCountries = (($_.Group | Group-Object Country | Sort-Object Count -Descending |
-            Select-Object -First 3).Name -join '; ')
-    }
-} | Sort-Object Occurrences -Descending
-
-$riskTypeAnalysis | Export-Csv -Path "CA_SignInRisk_MFA_RiskTypes.csv" -NoTypeInformation
-Write-Host "Risk type analysis exported to: CA_SignInRisk_MFA_RiskTypes.csv" -ForegroundColor Green
-
-Write-Host "`n=== RISK DETECTION TYPES ===" -ForegroundColor Magenta
-$riskTypeAnalysis | Format-Table RiskDetectionType, Occurrences, UniqueUsers, HighRiskCount, MediumRiskCount -AutoSize
-
-# === POLICY-SPECIFIC IMPACT ===
-Write-Host "`nAnalyzing impact by policy..." -ForegroundColor Cyan
-
-$policyImpact = $mfaImpactReport | Where-Object { $_.PolicyId -ne 'N/A' } |
-    Group-Object PolicyName | ForEach-Object {
-    $policySignIns = $_.Group
-    $challenges = $policySignIns | Where-Object { $_.WouldRequireMFA -eq 'Yes - Would Challenge' }
-
-    [PSCustomObject]@{
-        PolicyName = $_.Name
-        PolicyId = ($policySignIns | Select-Object -First 1).PolicyId
-
-        TotalEvaluations = $policySignIns.Count
-        WouldChallenge = $challenges.Count
-        ChallengeRate = [math]::Round(($challenges.Count / $policySignIns.Count) * 100, 2)
-
-        UniqueUsersImpacted = ($challenges | Select-Object -Unique UserPrincipalName).Count
-
-        HighRisk = ($challenges | Where-Object { $_.SignInRiskLevel -eq 'high' }).Count
-        MediumRisk = ($challenges | Where-Object { $_.SignInRiskLevel -eq 'medium' }).Count
-        LowRisk = ($challenges | Where-Object { $_.SignInRiskLevel -eq 'low' }).Count
-
-        TopRiskTypes = ((($challenges | ForEach-Object { $_.RiskDetectionTypes -split '; ' } |
-            Where-Object { $_ -ne 'None' } | Group-Object | Sort-Object Count -Descending |
-            Select-Object -First 3).Name) -join '; ')
-    }
-} | Sort-Object WouldChallenge -Descending
-
-$policyImpact | Export-Csv -Path "CA_SignInRisk_MFA_Policy_Impact.csv" -NoTypeInformation
-Write-Host "Policy impact analysis exported to: CA_SignInRisk_MFA_Policy_Impact.csv" -ForegroundColor Green
-
-Write-Host "`n=== POLICY IMPACT SUMMARY ===" -ForegroundColor Magenta
-$policyImpact | Format-Table PolicyName, TotalEvaluations, WouldChallenge, ChallengeRate, UniqueUsersImpacted -AutoSize
-
-# === APPLICATION IMPACT ===
-Write-Host "`nAnalyzing application impact..." -ForegroundColor Cyan
-
-$appImpact = $mfaChallenges | Group-Object AppDisplayName | ForEach-Object {
-    [PSCustomObject]@{
-        ApplicationName = $_.Name
-        MFAChallenges = $_.Count
-        UniqueUsers = ($_.Group | Select-Object -Unique UserPrincipalName).Count
-        HighRiskEvents = ($_.Group | Where-Object { $_.SignInRiskLevel -eq 'high' }).Count
-        MediumRiskEvents = ($_.Group | Where-Object { $_.SignInRiskLevel -eq 'medium' }).Count
-    }
-} | Sort-Object MFAChallenges -Descending
-
-$appImpact | Export-Csv -Path "CA_SignInRisk_MFA_App_Impact.csv" -NoTypeInformation
-Write-Host "Application impact analysis exported to: CA_SignInRisk_MFA_App_Impact.csv" -ForegroundColor Green
-
-Write-Host "`n=== TOP 10 APPLICATIONS AFFECTED ===" -ForegroundColor Magenta
-$appImpact | Select-Object -First 10 | Format-Table ApplicationName, MFAChallenges, UniqueUsers, HighRiskEvents -AutoSize
-
-# === FINAL SUMMARY ===
-Write-Host "`n========================================" -ForegroundColor Green
-Write-Host "ANALYSIS COMPLETE" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
-
-Write-Host "`nFiles Generated:" -ForegroundColor Cyan
-Write-Host "  1. CA_SignInRisk_MFA_Impact_Detail.csv - Every sign-in with MFA requirement status" -ForegroundColor White
-Write-Host "  2. CA_SignInRisk_MFA_By_RiskLevel.csv - MFA challenges broken down by risk level" -ForegroundColor White
-Write-Host "  3. CA_SignInRisk_MFA_User_Impact.csv - Per-user impact showing challenge frequency" -ForegroundColor White
-Write-Host "  4. CA_SignInRisk_MFA_RiskTypes.csv - Risk detection types triggering MFA" -ForegroundColor White
-Write-Host "  5. CA_SignInRisk_MFA_Policy_Impact.csv - Impact by individual CA policy" -ForegroundColor White
-Write-Host "  6. CA_SignInRisk_MFA_App_Impact.csv - Applications most affected by MFA challenges" -ForegroundColor White
-
-Write-Host "`nKey Metrics:" -ForegroundColor Cyan
-Write-Host "  • MFA Challenge Rate: $(Get-SafePercentage -Numerator $mfaChallenges.Count -Denominator $totalSignIns)% of sign-ins" -ForegroundColor White
-Write-Host "  • User Impact: $uniqueUsersChallenged of $totalUsers users ($(Get-SafePercentage -Numerator $uniqueUsersChallenged -Denominator $totalUsers)%)" -ForegroundColor White
-Write-Host "  • High Risk Events: $(($mfaChallenges | Where-Object { $_.SignInRiskLevel -eq 'high' }).Count)" -ForegroundColor White
-Write-Host "  • Medium Risk Events: $(($mfaChallenges | Where-Object { $_.SignInRiskLevel -eq 'medium' }).Count)" -ForegroundColor White
+Write-Host "Report exported to: CA_SignInRisk_MFA_Impact_Detail.csv" -ForegroundColor Green
