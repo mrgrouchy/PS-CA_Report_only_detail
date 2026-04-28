@@ -7,6 +7,7 @@ The script is optimized to surface **unexpected impacted users** by excluding us
 ## Script
 
 - `CA_report.ps1`
+- `Get-CAPolicySignInResults.ps1`
 
 ## What It Does
 
@@ -36,6 +37,24 @@ Run from this repository directory:
 
 ```powershell
 .\CA_report.ps1
+```
+
+Run a Conditional Access policy success/failure report for the last 12 hours:
+
+```powershell
+.\Get-CAPolicySignInResults.ps1 -Policy "Require MFA for admins" -Hours 12
+```
+
+Run by policy ID for the last 7 days:
+
+```powershell
+.\Get-CAPolicySignInResults.ps1 -Policy "00000000-0000-0000-0000-000000000000" -Days 7 -Export
+```
+
+Include non-success/failure outcomes such as `notApplied` and report-only interrupted results:
+
+```powershell
+.\Get-CAPolicySignInResults.ps1 -Policy "Require MFA for admins" -Days 1 -IncludeOtherResults
 ```
 
 Interactive mode now lets you choose:

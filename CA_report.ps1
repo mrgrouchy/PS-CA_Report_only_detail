@@ -27,7 +27,7 @@ param(
     [switch]$SimpleCA002ATest
 )
 
-# Default to Log Analytics (the working path from -SimpleCA002ATest)
+# Default to Log Analytics
 if (-not $UseGraphAPI) {
     $UseLogAnalytics = $true
 }
