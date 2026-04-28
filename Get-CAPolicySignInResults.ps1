@@ -111,19 +111,17 @@ function Invoke-GraphGetAll {
         [string]$Uri
     )
 
-    $items = New-Object System.Collections.Generic.List[object]
+    $items = @()
     $nextUri = $Uri
 
     do {
         $response = Invoke-MgGraphRequest -Method GET -Uri $nextUri
-        foreach ($item in @(Get-ObjectValue -InputObject $response -PropertyName "value")) {
-            $items.Add($item)
-        }
+        $items += @(Get-ObjectValue -InputObject $response -PropertyName "value")
 
         $nextUri = Get-ObjectValue -InputObject $response -PropertyName "@odata.nextLink"
     } while ($nextUri)
 
-    return @($items)
+    return $items
 }
 
 function Resolve-ConditionalAccessPolicy {
@@ -136,13 +134,13 @@ function Resolve-ConditionalAccessPolicy {
     $policies = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?`$select=$select"
 
     if (Test-GuidString -Value $PolicyValue) {
-        $match = @($policies | Where-Object { $_.id -eq $PolicyValue })
+        $match = @($policies | Where-Object { (Get-ObjectValue -InputObject $_ -PropertyName "id") -eq $PolicyValue })
         if ($match.Count -eq 1) {
             return $match[0]
         }
     }
 
-    $exactMatches = @($policies | Where-Object { $_.displayName -eq $PolicyValue })
+    $exactMatches = @($policies | Where-Object { (Get-ObjectValue -InputObject $_ -PropertyName "displayName") -eq $PolicyValue })
     if ($exactMatches.Count -eq 1) {
         return $exactMatches[0]
     }
@@ -151,13 +149,17 @@ function Resolve-ConditionalAccessPolicy {
         throw "Multiple Conditional Access policies have the display name '$PolicyValue'. Re-run with the policy ID."
     }
 
-    $partialMatches = @($policies | Where-Object { $_.displayName -like "*$PolicyValue*" })
+    $partialMatches = @($policies | Where-Object { (Get-ObjectValue -InputObject $_ -PropertyName "displayName") -like "*$PolicyValue*" })
     if ($partialMatches.Count -eq 1) {
         return $partialMatches[0]
     }
 
     if ($partialMatches.Count -gt 1) {
-        $names = ($partialMatches | Sort-Object displayName | ForEach-Object { "$($_.displayName) ($($_.id))" }) -join "`n  - "
+        $names = ($partialMatches |
+            Sort-Object { Get-ObjectValue -InputObject $_ -PropertyName "displayName" } |
+            ForEach-Object {
+                "$(Get-ObjectValue -InputObject $_ -PropertyName "displayName") ($(Get-ObjectValue -InputObject $_ -PropertyName "id"))"
+            }) -join "`n  - "
         throw "Multiple policies matched '$PolicyValue'. Re-run with the exact display name or policy ID:`n  - $names"
     }
 
@@ -196,6 +198,19 @@ function ConvertTo-FlatText {
     return [string]$Value
 }
 
+function Get-SafePercentage {
+    param(
+        [double]$Numerator,
+        [double]$Denominator
+    )
+
+    if ($Denominator -le 0) {
+        return 0
+    }
+
+    return [math]::Round(($Numerator / $Denominator) * 100, 2)
+}
+
 function Get-ObjectValue {
     param(
         [Parameter(Mandatory = $false)]
@@ -206,6 +221,14 @@ function Get-ObjectValue {
     )
 
     if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($PropertyName)) {
+            return $InputObject[$PropertyName]
+        }
+
         return $null
     }
 
@@ -239,7 +262,10 @@ $endFilter = $endDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
 Connect-GraphIfNeeded
 
 $resolvedPolicy = Resolve-ConditionalAccessPolicy -PolicyValue $Policy
-Write-Host "Policy: $($resolvedPolicy.displayName) ($($resolvedPolicy.id)) / State: $($resolvedPolicy.state)" -ForegroundColor Green
+$resolvedPolicyName = Get-ObjectValue -InputObject $resolvedPolicy -PropertyName "displayName"
+$resolvedPolicyId = Get-ObjectValue -InputObject $resolvedPolicy -PropertyName "id"
+$resolvedPolicyState = Get-ObjectValue -InputObject $resolvedPolicy -PropertyName "state"
+Write-Host "Policy: $resolvedPolicyName ($resolvedPolicyId) / State: $resolvedPolicyState" -ForegroundColor Green
 Write-Host "Timeframe: $startFilter to $endFilter UTC" -ForegroundColor Green
 
 $signInSelect = @(
@@ -256,15 +282,10 @@ $signInSelect = @(
     "correlationId",
     "conditionalAccessStatus",
     "appliedConditionalAccessPolicies",
-    "authenticationRequirement",
-    "authenticationMethodsUsed",
     "isInteractive",
     "status",
     "deviceDetail",
-    "location",
-    "riskLevelDuringSignIn",
-    "userRiskLevel",
-    "riskState"
+    "location"
 ) -join ","
 
 $filter = "createdDateTime ge $startFilter and createdDateTime le $endFilter"
@@ -278,7 +299,7 @@ Write-Host "Fetched $($signIns.Count) sign-ins in the requested window." -Foregr
 $detail = @(
     foreach ($signIn in $signIns) {
         $matchedPolicies = @(Get-ObjectValue -InputObject $signIn -PropertyName "appliedConditionalAccessPolicies" | Where-Object {
-            (Get-ObjectValue -InputObject $_ -PropertyName "id") -eq $resolvedPolicy.id
+            (Get-ObjectValue -InputObject $_ -PropertyName "id") -eq $resolvedPolicyId
         })
         if ($matchedPolicies.Count -eq 0) {
             continue
@@ -326,8 +347,8 @@ $detail = @(
                 RiskState = Get-ObjectValue -InputObject $signIn -PropertyName "riskState"
                 CorrelationId = Get-ObjectValue -InputObject $signIn -PropertyName "correlationId"
                 SignInId = Get-ObjectValue -InputObject $signIn -PropertyName "id"
-                PolicyName = $resolvedPolicy.displayName
-                PolicyId = $resolvedPolicy.id
+                PolicyName = $resolvedPolicyName
+                PolicyId = $resolvedPolicyId
             }
         }
     }
@@ -364,10 +385,156 @@ $userSummary = @(
         }
 )
 
+$appSummary = @(
+    $detail |
+        Group-Object AppDisplayName |
+        Sort-Object Count -Descending |
+        ForEach-Object {
+            $rows = @($_.Group)
+            [PSCustomObject]@{
+                AppDisplayName = if ([string]::IsNullOrWhiteSpace($_.Name)) { "(unknown)" } else { $_.Name }
+                Total = $_.Count
+                Successes = @($rows | Where-Object { $_.ResultType -eq "Success" }).Count
+                Failures = @($rows | Where-Object { $_.ResultType -eq "Failure" }).Count
+                Other = @($rows | Where-Object { $_.ResultType -eq "Other" }).Count
+                UniqueUsers = @($rows | Where-Object { $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
+                LastSeenUtc = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).TimestampUtc
+            }
+        }
+)
+
+$failureReasonSummary = @(
+    $detail |
+        Where-Object { $_.ResultType -eq "Failure" } |
+        Group-Object FailureReason |
+        Sort-Object Count -Descending |
+        Select-Object -First 10 |
+        ForEach-Object {
+            [PSCustomObject]@{
+                FailureReason = if ([string]::IsNullOrWhiteSpace($_.Name)) { "(not provided)" } else { $_.Name }
+                Count = $_.Count
+            }
+        }
+)
+
+$failingSignIns = @(
+    $detail |
+        Where-Object { $_.ResultType -eq "Failure" } |
+        Sort-Object TimestampUtc -Descending
+)
+
+$failingUserSummary = @(
+    $failingSignIns |
+        Group-Object UserPrincipalName |
+        Sort-Object Count -Descending |
+        Select-Object -First 10 |
+        ForEach-Object {
+            $rows = @($_.Group)
+            [PSCustomObject]@{
+                UserPrincipalName = if ([string]::IsNullOrWhiteSpace($_.Name)) { "(unknown)" } else { $_.Name }
+                Failures = $_.Count
+                Apps = (@($rows | Where-Object { $_.AppDisplayName } | Select-Object -ExpandProperty AppDisplayName -Unique) -join "; ")
+                LastFailureUtc = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).TimestampUtc
+                LastFailureReason = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).FailureReason
+                LastCorrelationId = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).CorrelationId
+            }
+        }
+)
+
+$failingAppSummary = @(
+    $failingSignIns |
+        Group-Object AppDisplayName |
+        Sort-Object Count -Descending |
+        Select-Object -First 10 |
+        ForEach-Object {
+            $rows = @($_.Group)
+            [PSCustomObject]@{
+                AppDisplayName = if ([string]::IsNullOrWhiteSpace($_.Name)) { "(unknown)" } else { $_.Name }
+                Failures = $_.Count
+                UniqueUsers = @($rows | Where-Object { $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
+                LastFailureUtc = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).TimestampUtc
+                LastFailureReason = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).FailureReason
+                LastCorrelationId = ($rows | Sort-Object TimestampUtc -Descending | Select-Object -First 1).CorrelationId
+            }
+        }
+)
+
+$recentFailures = @(
+    $failingSignIns |
+        Select-Object -First 15 TimestampUtc, UserPrincipalName, AppDisplayName, ClientAppUsed, IpAddress, FailureReason, SignInErrorCode, CorrelationId
+)
+
 Write-Host ""
-Write-Host "Conditional Access result summary" -ForegroundColor Cyan
+Write-Host "Conditional Access post-change monitor" -ForegroundColor Cyan
 if ($summary.Count -gt 0) {
+    $totalEvaluations = $detail.Count
+    $successCount = @($detail | Where-Object { $_.ResultType -eq "Success" }).Count
+    $failureCount = @($detail | Where-Object { $_.ResultType -eq "Failure" }).Count
+    $otherCount = @($detail | Where-Object { $_.ResultType -eq "Other" }).Count
+    $uniqueUsers = @($detail | Where-Object { $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
+    $uniqueApps = @($detail | Where-Object { $_.AppDisplayName } | Select-Object -ExpandProperty AppDisplayName -Unique).Count
+    $orderedDetail = @($detail | Sort-Object TimestampUtc)
+
+    [PSCustomObject]@{
+        TotalEvaluations = $totalEvaluations
+        Successes = $successCount
+        Failures = $failureCount
+        Other = $otherCount
+        SuccessRate = "$(Get-SafePercentage -Numerator $successCount -Denominator $totalEvaluations)%"
+        FailureRate = "$(Get-SafePercentage -Numerator $failureCount -Denominator $totalEvaluations)%"
+        UniqueUsers = $uniqueUsers
+        UniqueApps = $uniqueApps
+        FirstSeenUtc = $orderedDetail[0].TimestampUtc
+        LastSeenUtc = $orderedDetail[-1].TimestampUtc
+    } | Format-List
+
+    if ($failureCount -gt 0) {
+        Write-Host "Action focus: failing authentications detected" -ForegroundColor Yellow
+        [PSCustomObject]@{
+            FailingUsers = @($failingSignIns | Where-Object { $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
+            FailingApps = @($failingSignIns | Where-Object { $_.AppDisplayName } | Select-Object -ExpandProperty AppDisplayName -Unique).Count
+            MostRecentFailureUtc = $failingSignIns[0].TimestampUtc
+            MostRecentFailureUser = $failingSignIns[0].UserPrincipalName
+            MostRecentFailureApp = $failingSignIns[0].AppDisplayName
+            MostRecentFailureReason = $failingSignIns[0].FailureReason
+            MostRecentCorrelationId = $failingSignIns[0].CorrelationId
+        } | Format-List
+    } else {
+        Write-Host "No failing authentications found for this policy in the selected window." -ForegroundColor Green
+    }
+
+    Write-Host "By policy result" -ForegroundColor Cyan
     $summary | Format-Table -AutoSize
+
+    if ($failingUserSummary.Count -gt 0) {
+        Write-Host "Users with failures" -ForegroundColor Yellow
+        $failingUserSummary | Format-Table -AutoSize
+    }
+
+    if ($failingAppSummary.Count -gt 0) {
+        Write-Host "Apps with failures" -ForegroundColor Yellow
+        $failingAppSummary | Format-Table -AutoSize
+    }
+
+    if ($recentFailures.Count -gt 0) {
+        Write-Host "Recent failures" -ForegroundColor Yellow
+        $recentFailures | Format-Table -AutoSize
+    }
+
+    if ($userSummary.Count -gt 0) {
+        Write-Host "Top users by total evaluations" -ForegroundColor Cyan
+        $userSummary | Select-Object -First 10 | Format-Table -AutoSize
+    }
+
+    if ($appSummary.Count -gt 0) {
+        Write-Host "Top apps by total evaluations" -ForegroundColor Cyan
+        $appSummary | Select-Object -First 10 | Format-Table -AutoSize
+    }
+
+    if ($failureReasonSummary.Count -gt 0) {
+        Write-Host "Top failure reasons" -ForegroundColor Cyan
+        $failureReasonSummary | Format-Table -AutoSize
+    }
 } else {
     Write-Host "No matching success/failure policy evaluations found." -ForegroundColor Yellow
     if (-not $IncludeOtherResults) {
@@ -385,22 +552,25 @@ if (-not (Test-Path -LiteralPath $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath | Out-Null
 }
 
-$safePolicyName = ($resolvedPolicy.displayName -replace '[\\/:*?"<>|]', '_').Trim()
+$safePolicyName = ($resolvedPolicyName -replace '[\\/:*?"<>|]', '_').Trim()
 if ([string]::IsNullOrWhiteSpace($safePolicyName)) {
-    $safePolicyName = $resolvedPolicy.id
+    $safePolicyName = $resolvedPolicyId
 }
 
 $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $detailPath = Join-Path $OutputPath "CA_Policy_Results_${safePolicyName}_${timestamp}_Detail.csv"
 $summaryPath = Join-Path $OutputPath "CA_Policy_Results_${safePolicyName}_${timestamp}_Summary.csv"
 $userSummaryPath = Join-Path $OutputPath "CA_Policy_Results_${safePolicyName}_${timestamp}_UserSummary.csv"
+$appSummaryPath = Join-Path $OutputPath "CA_Policy_Results_${safePolicyName}_${timestamp}_AppSummary.csv"
 
 $detail | Export-Csv -Path $detailPath -NoTypeInformation -Encoding UTF8
 $summary | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
 $userSummary | Export-Csv -Path $userSummaryPath -NoTypeInformation -Encoding UTF8
+$appSummary | Export-Csv -Path $appSummaryPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
 Write-Host "Wrote:" -ForegroundColor Green
 Write-Host "  $detailPath"
 Write-Host "  $summaryPath"
 Write-Host "  $userSummaryPath"
+Write-Host "  $appSummaryPath"
