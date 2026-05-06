@@ -1,13 +1,44 @@
 <#
 .SYNOPSIS
-WIP script to evaluate report-only Conditional Access MFA/risk impact.
+Analyzes unexpected user impact from report-only Conditional Access risk/MFA policies using Microsoft Graph or Log Analytics.
 
 .DESCRIPTION
-Early/in-progress utility. Behavior and parameters may change.
+Connects to Microsoft Graph, reads report-only Conditional Access policies, correlates
+them with recent sign-in activity, and exports detailed CSV reports that show where MFA
+would have been required if those policies were enforced. Sign-in activity can be sourced
+from Microsoft Graph sign-in logs (default) or Azure Log Analytics SigninLogs
+(-UseLogAnalytics). Users already included in the enabled production policy target groups
+are excluded so outputs focus on unexpected impact.
 
 .EXAMPLE
 PS> .\CA_report.ps1
-Runs the current draft workflow.
+Prompts you to choose a target report-only policy (or all), runs the analysis for the
+last 2 days, auto-detects the enabled production policy with 4 target groups when
+possible, and exports CSV reports to the current directory.
+
+.EXAMPLE
+PS> pwsh -ExecutionPolicy Bypass -File .\CA_report.ps1
+Runs the same analysis from a PowerShell host where script execution policy is restricted.
+
+.EXAMPLE
+PS> .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins"
+Runs analysis for the specified report-only policy name (or policy ID) without interactive
+selection.
+
+.EXAMPLE
+PS> .\CA_report.ps1 -TargetPolicy "Require MFA for risky sign-ins" -ProdPolicy "Prod - Sign-in Risk - MFA"
+Runs analysis against a specific report-only policy and explicitly uses the named enabled
+production policy to resolve expected-user exclusions from its target groups.
+
+.EXAMPLE
+PS> .\CA_report.ps1 -UseLogAnalytics -LogAnalyticsWorkspaceId "00000000-0000-0000-0000-000000000000"
+Runs analysis using SigninLogs data from the specified Log Analytics workspace instead of
+pulling sign-ins directly from Microsoft Graph.
+
+.EXAMPLE
+PS> .\CA_report.ps1 -TargetPolicy "CA002A" -UseLogAnalytics -LogAnalyticsWorkspaceId "00000000-0000-0000-0000-000000000000" -NoGroupCheck
+Runs a specific report-only policy against Log Analytics sign-in data and disables
+expected-user exclusion.
 
 .NOTES
 Required Microsoft Graph scopes: AuditLog.Read.All, Policy.Read.All, Group.Read.All
@@ -19,18 +50,10 @@ param(
     [string]$TargetPolicy,
     [switch]$AllPolicies,
     [string]$ProdPolicy,
-    [switch]$All,
     [switch]$UseLogAnalytics,
     [string]$LogAnalyticsWorkspaceId,
-    [switch]$NoGroupCheck,
-    [switch]$UseGraphAPI,
-    [switch]$SimpleCA002ATest
+    [switch]$NoGroupCheck
 )
-
-# Default to Log Analytics
-if (-not $UseGraphAPI) {
-    $UseLogAnalytics = $true
-}
 
 # Hardcode expected-impact group IDs here (recommended: object IDs, not names).
 # If populated, these groups take precedence over -ProdPolicy/auto-discovery.
@@ -41,16 +64,16 @@ $HardcodedExpectedGroupIds = @(
     # "00000000-0000-0000-0000-000000000004"
 )
 
-# Hardcoded Log Analytics workspace (redacted)
-$WorkspaceId = "00000000-0000-0000-0000-000000000000"
+# Hardcoded Log Analytics workspace
+$WorkspaceId = "<your-log-analytics-workspace-id>"
 
 # ------------------------------------------------------------
 # Graph connection
 # ------------------------------------------------------------
 
-$TenantId  = "00000000-0000-0000-0000-000000000000"
-$ClientId  = "00000000-0000-0000-0000-000000000000"
-$Thumbprint = "0000000000000000000000000000000000000000"   # cert must exist in CurrentUser\My or LocalMachine\My
+$TenantId  = "<your-tenant-id>"
+$ClientId  = "<your-app-client-id>"
+$Thumbprint = "<your-certificate-thumbprint>"   # cert must exist in CurrentUser\My or LocalMachine\My
 
 function Test-GraphConnectivity {
   try {
@@ -250,16 +273,6 @@ function Convert-LogAnalyticsSignIn {
 
 Write-Host "=== SIGN-IN RISK & MFA REQUIREMENT ANALYSIS ===" -ForegroundColor Cyan
 Write-Host "Analyzing report-only CA policies for sign-in risk and MFA impact..." -ForegroundColor Yellow
-Write-Host "Date range: $((Get-Date).AddDays(-2).ToString('yyyy-MM-dd')) to $((Get-Date).ToString('yyyy-MM-dd'))`n" -ForegroundColor Yellow
-
-if ($SimpleCA002ATest) {
-    $TargetPolicy = "CA002A - All apps All Users: Require MFA when High or Medium User sign-in risk"
-    $AllPolicies = $false
-    $NoGroupCheck = $true
-    $UseLogAnalytics = $true
-    Write-Host "Simple test mode enabled: CA002A, last 48 hours, reportOnlyInterrupted only, no group exclusion." -ForegroundColor Yellow
-}
-
 # Fetch all CA policies to identify risk-based ones
 Write-Host "Fetching Conditional Access policies..." -ForegroundColor Cyan
 $caPolicies = @()
@@ -351,8 +364,6 @@ $expectedUserIds = [System.Collections.Generic.HashSet[string]]::new([System.Str
 $expectedGroups = @()
 if ($NoGroupCheck) {
     Write-Host "`n-NoGroupCheck specified. Skipping group-based expected-user exclusion." -ForegroundColor Yellow
-} elseif ($All) {
-    Write-Host "`n-All switch specified. Group-based expected-user exclusion is disabled." -ForegroundColor Yellow
 } else {
     $hardcodedGroupIds = @($HardcodedExpectedGroupIds | Where-Object { $_ -and $_ -ne 'All' })
     if ($hardcodedGroupIds.Count -gt 0) {
@@ -469,6 +480,9 @@ if ($UseLogAnalytics) {
 
     # Split long ranges into smaller chunks to avoid Az.OperationalInsights client timeout (100s default).
     $chunkHours = 6
+    $chunkMaxRetries = 8
+    $chunkRetryBaseDelaySeconds = 15
+    $chunkRetryMaxDelaySeconds = 300
     $windowStart = [datetime]::Parse($startDate)
     $windowEnd = [datetime]::Parse($endDate)
     $laRows = @()
@@ -499,16 +513,42 @@ SigninLogs
 "@
 
         Write-Host "    Querying chunk: $chunkStartText -> $chunkEndText" -ForegroundColor DarkCyan
-        try {
-            $laResponse = Invoke-AzOperationalInsightsQuery -WorkspaceId $queryWorkspaceId -Query $kql -ErrorAction Stop
-            $chunkRows = @($laResponse.Results)
-            $laRows += $chunkRows
-            Write-Host "      Returned $($chunkRows.Count) rows (running total: $($laRows.Count))." -ForegroundColor Gray
-        } catch {
-            Write-Host "  ERROR: Log Analytics chunk query failed for $chunkStartText -> $chunkEndText" -ForegroundColor Red
-            Write-Host "  Details: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  Try a shorter lookback window while testing." -ForegroundColor Yellow
-            return
+        $chunkAttempt = 0
+        $chunkCompleted = $false
+        while (-not $chunkCompleted) {
+            $chunkAttempt++
+            try {
+                $laResponse = Invoke-AzOperationalInsightsQuery -WorkspaceId $queryWorkspaceId -Query $kql -ErrorAction Stop
+                $chunkRows = @($laResponse.Results)
+                $laRows += $chunkRows
+                Write-Host "      Returned $($chunkRows.Count) rows (running total: $($laRows.Count))." -ForegroundColor Gray
+                $chunkCompleted = $true
+            } catch {
+                $errorMessage = $_.Exception.Message
+                $isTimeout = ($errorMessage -match 'HttpClient\.Timeout') -or ($errorMessage -match 'timed out') -or ($errorMessage -match 'request was canceled')
+                $isTransient = $isTimeout -or ($errorMessage -match '429|Too Many Requests|503|504|temporar')
+
+                if ($isTransient -and $chunkAttempt -lt $chunkMaxRetries) {
+                    $retryDelay = [int][math]::Min(
+                        $chunkRetryMaxDelaySeconds,
+                        $chunkRetryBaseDelaySeconds * [math]::Pow(2, ($chunkAttempt - 1))
+                    )
+
+                    Write-Host "      WARN: Chunk query transient failure (attempt $chunkAttempt/$chunkMaxRetries). Retrying in $retryDelay seconds..." -ForegroundColor Yellow
+                    Write-Host "      Details: $errorMessage" -ForegroundColor DarkYellow
+                    Start-Sleep -Seconds $retryDelay
+                    continue
+                }
+
+                Write-Host "  ERROR: Log Analytics chunk query failed for $chunkStartText -> $chunkEndText" -ForegroundColor Red
+                Write-Host "  Details: $errorMessage" -ForegroundColor Red
+                if ($isTransient) {
+                    Write-Host "  Exhausted retries ($chunkMaxRetries attempts) for this chunk. Exiting." -ForegroundColor Red
+                } else {
+                    Write-Host "  Non-transient query error. Exiting." -ForegroundColor Red
+                }
+                return
+            }
         }
 
         $chunkStart = $chunkEnd
@@ -668,9 +708,6 @@ foreach ($signIn in $allSignIns) {
             # Identifiers
             CorrelationId = $signIn.correlationId
             SignInId = $signIn.id
-
-            # Scope Check
-            IsMemberOfExpectedGroups = if ($expectedUserIds.Count -gt 0 -and $signIn.userId -and $expectedUserIds.Contains($signIn.userId)) { 'Yes' } else { 'No' }
         }
     }
 }
